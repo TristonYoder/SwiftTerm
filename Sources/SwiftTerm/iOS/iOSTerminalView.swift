@@ -32,6 +32,26 @@ public extension Notification.Name {
     static let terminalViewMetaModifierReset = Notification.Name("SwiftTerm.TerminalView.metaModifierReset")
 }
 
+/// A pan recognizer fed by wheel and trackpad scroll events alone.
+///
+/// A scroll event is neither a touch nor a pointer drag: it reaches a pan
+/// recognizer only through `allowedScrollTypesMask`, and the touch recognizers
+/// never see it. Accepting only `.scroll` here keeps fingers and pointer drags
+/// on their own recognizers.
+final class ScrollWheelGestureRecognizer: UIPanGestureRecognizer {
+    override init(target: Any?, action: Selector?) {
+        super.init(target: target, action: action)
+        allowedScrollTypesMask = [.continuous, .discrete]
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func shouldReceive(_ event: UIEvent) -> Bool {
+        event.type == .scroll
+    }
+}
+
 /**
  * TerminalView provides an AppKit/UIKit front-end to the `Terminal` terminal emulator.
  * It is up to a subclass to either wire the terminal emulator to a remote terminal
@@ -1319,6 +1339,74 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         panMouseGesture = nil
     }
     
+    var scrollWheelGesture: UIPanGestureRecognizer?
+
+    /// Captures trackpad/mouse-wheel scroll so it can be forwarded to the
+    /// application as mouse-wheel events. Only installed while the client has
+    /// requested mouse reporting, so the scroll view keeps its own scrollback
+    /// scrolling otherwise.
+    func enableScrollWheelGesture () {
+        guard scrollWheelGesture == nil else {
+            return
+        }
+        let gesture = ScrollWheelGestureRecognizer (target: self, action: #selector(handleScrollWheelGesture))
+        addGestureRecognizer(gesture)
+        scrollWheelGesture = gesture
+        // The scroll view's own pan also consumes scroll events; take them
+        // away so a wheel over a mouse-aware app is not double-handled.
+        panGestureRecognizer.allowedScrollTypesMask = []
+    }
+    
+    func disableScrollWheelGesture () {
+        guard let gesture = scrollWheelGesture else {
+            return
+        }
+        removeGestureRecognizer(gesture)
+        scrollWheelGesture = nil
+        panGestureRecognizer.allowedScrollTypesMask = .all
+    }
+    
+    /// Leftover fractional scroll (in points) carried between events so
+    /// sub-cell deltas accumulate instead of being dropped.
+    private var scrollAccumulator: CGFloat = 0
+    
+    @objc func handleScrollWheelGesture (_ gesture: UIPanGestureRecognizer) {
+        switch gesture.state {
+        case .began:
+            scrollAccumulator = 0
+        case .changed, .ended:
+            let translation = gesture.translation(in: self)
+            gesture.setTranslation(.zero, in: self)
+            forwardPointerScroll(deltaY: -translation.y)
+        default:
+            break
+        }
+    }
+    
+    /// Forwards a scroll to the application as wheel button events (4 = up,
+    /// 5 = down), mirroring the macOS scroll wheel handling.
+    func forwardPointerScroll(deltaY: CGFloat) {
+        guard cellDimension.height > 0, allowMouseReporting, terminal.mouseMode != .off else { return }
+        scrollAccumulator += deltaY
+        let lines = Int(scrollAccumulator / cellDimension.height)
+        scrollAccumulator -= CGFloat(lines) * cellDimension.height
+        guard lines != 0 else { return }
+        let scrollingUp = lines > 0
+        let magnitude = abs(lines)
+        let point = lastPointerLocation ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        let hit = calculateTapHit(point: point)
+        guard let grid = hit.grid.toScreenCoordinate(from: terminal.displayBuffer) else { return }
+        let flags = terminal.encodeButton(
+            button: scrollingUp ? 4 : 5,
+            release: false,
+            shift: false,
+            meta: false,
+            control: terminalAccessory?.controlModifier ?? controlModifier ?? false)
+        for _ in 0..<magnitude {
+            terminal.sendEvent(buttonFlags: flags, x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+        }
+    }
+    
     var panSelectionGesture: UIPanGestureRecognizer?
     func enableSelectionPanGesture () {
         guard panSelectionGesture == nil else {
@@ -2022,50 +2110,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     open override var contentOffset: CGPoint {
         didSet {
             syncYDispFromContentOffset()
-            if !isTracking, !isDecelerating, !updatingContentOffsetFromTerminal,
-               allowMouseReporting, terminal != nil, terminal.mouseMode != .off {
-                let deltaY = contentOffset.y - oldValue.y
-                if abs(deltaY) > contentOffsetTolerance {
-                    forwardPointerScroll(deltaY: deltaY)
-                    // Cancel the platform pan: the app owns the wheel.
-                    updatingContentOffsetFromTerminal = true
-                    contentOffset = oldValue
-                    updatingContentOffsetFromTerminal = false
-                }
-            }
 #if canImport(MetalKit)
             if useMetalRenderer, metalView != nil {
                 requestMetalDisplay()
             }
 #endif
-        }
-    }
-
-    /// Leftover fractional trackpad scroll (in points) accumulated between
-    /// events so sub-cell precise deltas are not dropped.
-    private var scrollAccumulator: CGFloat = 0
-
-    /// Forwards a pointer scroll to the application as wheel button events
-    /// (4 = up, 5 = down), mirroring the macOS scroll wheel handling.
-    func forwardPointerScroll(deltaY: CGFloat) {
-        guard cellDimension.height > 0 else { return }
-        scrollAccumulator += deltaY
-        let lines = Int(scrollAccumulator / cellDimension.height)
-        scrollAccumulator -= CGFloat(lines) * cellDimension.height
-        guard lines != 0 else { return }
-        let scrollingUp = lines > 0
-        let magnitude = abs(lines)
-        let point = lastPointerLocation ?? CGPoint(x: bounds.midX, y: bounds.midY)
-        let hit = calculateTapHit(point: point)
-        guard let grid = hit.grid.toScreenCoordinate(from: terminal.displayBuffer) else { return }
-        let flags = terminal.encodeButton(
-            button: scrollingUp ? 4 : 5,
-            release: false,
-            shift: false,
-            meta: false,
-            control: terminalAccessory?.controlModifier ?? controlModifier ?? false)
-        for _ in 0..<magnitude {
-            terminal.sendEvent(buttonFlags: flags, x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
     }
 
@@ -3410,8 +3459,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     open func mouseModeChanged(source: Terminal) {
         if source.mouseMode != .off {
             enableMousePanGesture()
+            enableScrollWheelGesture()
         } else {
             disableMousePanGesture()
+            disableScrollWheelGesture()
         }
     }
     
