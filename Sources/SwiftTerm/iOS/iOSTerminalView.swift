@@ -1377,7 +1377,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         case .changed, .ended:
             let translation = gesture.translation(in: self)
             gesture.setTranslation(.zero, in: self)
-            forwardPointerScroll(deltaY: -translation.y)
+            forwardPointerScroll(deltaY: translation.y)
         default:
             break
         }
