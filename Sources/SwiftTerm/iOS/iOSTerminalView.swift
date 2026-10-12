@@ -1389,6 +1389,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             lastPointerLocation = location
             reportLinkIfNeeded(at: location, modifiers: [], force: true)
             updateLinkHighlightIfNeeded(at: location, modifiers: [.command], force: true)
+            // Forward pointer motion to apps that ask for it (mouse mode 1002/1003).
+            if allowMouseReporting, terminal.mouseMode.sendMotionEvent() {
+                let hit = calculateTapHit(point: location)
+                if let grid = hit.grid.toScreenCoordinate(from: terminal.displayBuffer) {
+                    terminal.sendMotion(buttonFlags: encodeFlags(release: true), x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
+                }
+            }
         case .ended, .cancelled:
             lastReportedLink = nil
             if linkHighlightMode == .hover || linkHighlightMode == .hoverWithModifier {
@@ -2015,11 +2022,50 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     open override var contentOffset: CGPoint {
         didSet {
             syncYDispFromContentOffset()
+            if !isTracking, !isDecelerating, !updatingContentOffsetFromTerminal,
+               allowMouseReporting, terminal != nil, terminal.mouseMode != .off {
+                let deltaY = contentOffset.y - oldValue.y
+                if abs(deltaY) > contentOffsetTolerance {
+                    forwardPointerScroll(deltaY: deltaY)
+                    // Cancel the platform pan: the app owns the wheel.
+                    updatingContentOffsetFromTerminal = true
+                    contentOffset = oldValue
+                    updatingContentOffsetFromTerminal = false
+                }
+            }
 #if canImport(MetalKit)
             if useMetalRenderer, metalView != nil {
                 requestMetalDisplay()
             }
 #endif
+        }
+    }
+
+    /// Leftover fractional trackpad scroll (in points) accumulated between
+    /// events so sub-cell precise deltas are not dropped.
+    private var scrollAccumulator: CGFloat = 0
+
+    /// Forwards a pointer scroll to the application as wheel button events
+    /// (4 = up, 5 = down), mirroring the macOS scroll wheel handling.
+    func forwardPointerScroll(deltaY: CGFloat) {
+        guard cellDimension.height > 0 else { return }
+        scrollAccumulator += deltaY
+        let lines = Int(scrollAccumulator / cellDimension.height)
+        scrollAccumulator -= CGFloat(lines) * cellDimension.height
+        guard lines != 0 else { return }
+        let scrollingUp = lines > 0
+        let magnitude = abs(lines)
+        let point = lastPointerLocation ?? CGPoint(x: bounds.midX, y: bounds.midY)
+        let hit = calculateTapHit(point: point)
+        guard let grid = hit.grid.toScreenCoordinate(from: terminal.displayBuffer) else { return }
+        let flags = terminal.encodeButton(
+            button: scrollingUp ? 4 : 5,
+            release: false,
+            shift: false,
+            meta: false,
+            control: terminalAccessory?.controlModifier ?? controlModifier ?? false)
+        for _ in 0..<magnitude {
+            terminal.sendEvent(buttonFlags: flags, x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
     }
 
